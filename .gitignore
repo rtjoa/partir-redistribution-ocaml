@@ -1,0 +1,22 @@
+# Build artifacts
+_build/
+*.install
+
+# Logs
+*.log
+
+# OPAM files
+*.opam.locked
+
+# Merlin files
+.merlin
+
+# IDE/Editor specific files
+.vscode/
+.idea/
+*.swp
+*~
+
+# OS generated files
+.DS_Store
+Thumbs.db
