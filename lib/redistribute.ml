@@ -66,7 +66,7 @@ let get_top_two_axes_exn (ty : Array_type.t) (i : int) =
   | x :: y :: _ -> (x, y)
   | _ -> raise_s [%message "Expected >=2 axes" (ty : Array_type.t) (i : int)]
 
-let rec perform_one (mesh : Mesh.t) (collective : Collective.t)
+let rec perform_one' (mesh : Mesh.t) (collective : Collective.t)
     (ty : Array_type.t) : Array_type.t =
   let open Array_type.Dim in
   match collective with
@@ -92,10 +92,12 @@ let rec perform_one (mesh : Mesh.t) (collective : Collective.t)
             global_size;
           })
   | All_to_all (from_dim, to_dim) ->
+      assert (from_dim <> to_dim);
       let axis = get_top_axis_exn ty from_dim in
       perform_one mesh (Collective.All_gather from_dim) ty
       |> perform_one mesh (Collective.Dyn_slice (to_dim, axis))
   | Swap_eq_size_tops (i, j) ->
+      assert (i <> j);
       let axis_i = get_top_axis_exn ty i in
       let axis_j = get_top_axis_exn ty j in
       assert (Mesh.axis_size_exn mesh axis_i = Mesh.axis_size_exn mesh axis_j);
@@ -121,6 +123,11 @@ let rec perform_one (mesh : Mesh.t) (collective : Collective.t)
             not
               (List.mem (Array_type.Dim.axes dim) replicated_axis
                  ~equal:String.equal)));
+      (* ith dim must contain axis_i *)
+      assert (
+        Map.find_exn ty i |> Array_type.Dim.axes
+        |> List.find ~f:(String.equal axis_i)
+        |> Option.is_some);
       update_existing_exn ty i ~f:(fun { local_size; axes; global_size } ->
           let axis_i_idx =
             List.findi_exn axes ~f:(fun _idx axis -> String.equal axis axis_i)
@@ -134,6 +141,16 @@ let rec perform_one (mesh : Mesh.t) (collective : Collective.t)
             global_size;
           })
   | Swap_within (i, axis_i, axis_j) ->
+      (* ith dim must contain axis_i *)
+      assert (
+        Map.find_exn ty i |> Array_type.Dim.axes
+        |> List.find ~f:(String.equal axis_i)
+        |> Option.is_some);
+      (* must also contain axis_j *)
+      assert (
+        Map.find_exn ty i |> Array_type.Dim.axes
+        |> List.find ~f:(String.equal axis_j)
+        |> Option.is_some);
       update_existing_exn ty i ~f:(fun { local_size; axes; global_size } ->
           {
             local_size;
@@ -145,6 +162,38 @@ let rec perform_one (mesh : Mesh.t) (collective : Collective.t)
             global_size;
           })
 
+and perform_one (mesh : Mesh.t) (collective : Collective.t) (ty : Array_type.t)
+    : Array_type.t =
+  if
+    Map.exists ty ~f:(fun dim ->
+        Array_type.Dim.axes dim
+        |> List.fold ~init:(Array_type.Dim.local_size dim) ~f:(fun n axis ->
+               n * Mesh.axis_size_exn mesh axis)
+        |> Int.( <> ) (Array_type.Dim.global_size dim))
+  then
+    raise_s
+      [%message
+        "bad src"
+          (mesh : Mesh.t)
+          (collective : Collective.t)
+          (ty : Array_type.t)];
+  let ty' = perform_one' mesh collective ty in
+  if
+    Map.exists ty ~f:(fun dim ->
+        Array_type.Dim.axes dim
+        |> List.fold ~init:(Array_type.Dim.local_size dim) ~f:(fun n axis ->
+               n * Mesh.axis_size_exn mesh axis)
+        |> Int.( <> ) (Array_type.Dim.global_size dim))
+  then
+    raise_s
+      [%message
+        "bad output"
+          (mesh : Mesh.t)
+          (collective : Collective.t)
+          (ty : Array_type.t)
+          (ty' : Array_type.t)];
+  ty'
+
 let perform (mesh : Mesh.t) (pgrm : Collective.t list) (ty : Array_type.t) =
   List.fold pgrm ~init:ty ~f:(fun ty collective ->
       perform_one mesh collective ty)
@@ -153,6 +202,7 @@ let perform_with_history (mesh : Mesh.t) (pgrm : Collective.t list)
     (ty : Array_type.t) =
   List.fold pgrm ~init:[ ty ] ~f:(fun tys collective ->
       perform_one mesh collective (List.hd_exn tys) :: tys)
+  |> List.rev
 
 module Collective_with_explicit_axes = struct
   type t =
@@ -175,7 +225,7 @@ module Collective_with_explicit_axes = struct
     | Swap_within (i, x, y) -> Swap_within (i, x, y)
 end
 
-(* This function is more-or-less the constructive proof Lemmas 4.6 and 4.7 *)
+(* This function is nearly the constructive proof of Lemmas 4.6 and 4.7 *)
 let fix_adjacent_collectives mesh src c1 c2 =
   let open Collective in
   match
@@ -215,9 +265,21 @@ let fix_adjacent_collectives mesh src c1 c2 =
   | All_gather (i, _), Swap_within (k, ax_k1, ax_k2) ->
       (* These commute even if i=k; all mentioned axes must be distinct *)
       [ c2; c1 ]
-  | All_gather (i, _), Swap_for_eq_size_replicated (k, ax_k, ax_replicated) ->
-      (* These commute even if i=k; all mentioned axes must be distinct *)
-      [ c2; c1 ]
+  | All_gather (i, ax_i), Swap_for_eq_size_replicated (k, ax_k, ax_replicated)
+    ->
+      if not (String.equal ax_i ax_replicated) then [ c2; c1 ]
+      else if i = k then [ Swap_within (i, ax_i, ax_k); All_gather i ]
+      else
+        let ax_k_top = get_top_axis_exn src k in
+        if String.equal ax_k_top ax_k then
+          [ Swap_eq_size_tops (k, i); All_gather i ]
+        else
+          [
+            Swap_within (k, ax_k_top, ax_k);
+            Swap_eq_size_tops (k, i);
+            Swap_within (k, ax_i, ax_k_top);
+            All_gather i;
+          ]
   (* Move falling edge earlier: ¯\ ~~> \_ *)
   | All_to_all (k, l, ax_k), Dyn_slice (i, ax_i) ->
       if i = k then
@@ -233,7 +295,20 @@ let fix_adjacent_collectives mesh src c1 c2 =
       else [ Dyn_slice (i, ax_i); Swap_eq_size_tops (k, l) ]
   | Swap_within (k, ax_k1, ax_k2), Dyn_slice (i, ax_i) -> [ c2; c1 ]
   | Swap_for_eq_size_replicated (k, ax_k, ax_replicated), Dyn_slice (i, ax_i) ->
-      [ c2; c1 ]
+      if not (String.equal ax_k ax_i) then [ c2; c1 ]
+      else if i = k then
+        [ Dyn_slice (i, ax_replicated); Swap_within (i, ax_replicated, ax_k) ]
+      else
+        let ax_k_top = get_top_axis_exn src k in
+        if String.equal ax_k_top ax_k then
+          [ Dyn_slice (i, ax_replicated); Swap_eq_size_tops (i, k) ]
+        else
+          [
+            Dyn_slice (i, ax_replicated);
+            Swap_within (k, ax_k, ax_k_top);
+            Swap_eq_size_tops (i, k);
+            Swap_within (k, ax_replicated, ax_k_top);
+          ]
   (* Flat-flat *)
   | ( ( All_to_all _ | Swap_eq_size_tops _ | Swap_for_eq_size_replicated _
       | Swap_within _ ),
@@ -255,8 +330,27 @@ let fix_adjacent_collectives mesh src c1 c2 =
   | Dyn_slice _, Dyn_slice _ ->
       [ c1; c2 ]
 
-let fix_adjacent_collectives_and_check mesh src c1 c2 =
+let fix_adjacent_collectives_and_check mesh src c1 c2 : Collective.t list =
   let cs = fix_adjacent_collectives mesh src c1 c2 in
+  (try perform mesh cs src |> ignore
+   with Assert_failure _ ->
+     print_s
+       [%message
+         (mesh : Mesh.t)
+           (src : Array_type.t)
+           (c1 : Collective.t)
+           (c2 : Collective.t)
+           (cs : Collective.t list)]);
+  if not (Array_type.equal (perform mesh cs src) (perform mesh [ c1; c2 ] src))
+  then
+    raise_s
+      [%message
+        (mesh : Mesh.t)
+          (src : Array_type.t)
+          (c1 : Collective.t)
+          (c2 : Collective.t)
+          (cs : Collective.t list)];
+
   assert (Array_type.equal (perform mesh cs src) (perform mesh [ c1; c2 ] src));
   cs
 
@@ -355,24 +449,24 @@ let%expect_test "redistribute easy" =
   print_s [%sexp (path : Array_type.t list)];
   [%expect
     {|
-    (((0 ((local_size 2) (axes (y1 y2)) (global_size 12)))
-      (1 ((local_size 3) (axes (x1 x2)) (global_size 12))))
-     ((0 ((local_size 2) (axes (y1 y2)) (global_size 12)))
-      (1 ((local_size 6) (axes (x2)) (global_size 12))))
-     ((0 ((local_size 2) (axes (y1 y2)) (global_size 12)))
-      (1 ((local_size 12) (axes ()) (global_size 12))))
-     ((0 ((local_size 6) (axes (y2)) (global_size 12)))
-      (1 ((local_size 12) (axes ()) (global_size 12))))
-     ((0 ((local_size 12) (axes ()) (global_size 12)))
-      (1 ((local_size 12) (axes ()) (global_size 12))))
-     ((0 ((local_size 12) (axes ()) (global_size 12)))
-      (1 ((local_size 6) (axes (y2)) (global_size 12))))
-     ((0 ((local_size 12) (axes ()) (global_size 12)))
+    (((0 ((local_size 3) (axes (x1 x2)) (global_size 12)))
       (1 ((local_size 2) (axes (y1 y2)) (global_size 12))))
      ((0 ((local_size 6) (axes (x2)) (global_size 12)))
       (1 ((local_size 2) (axes (y1 y2)) (global_size 12))))
-     ((0 ((local_size 3) (axes (x1 x2)) (global_size 12)))
-      (1 ((local_size 2) (axes (y1 y2)) (global_size 12))))) |}];
+     ((0 ((local_size 12) (axes ()) (global_size 12)))
+      (1 ((local_size 2) (axes (y1 y2)) (global_size 12))))
+     ((0 ((local_size 12) (axes ()) (global_size 12)))
+      (1 ((local_size 6) (axes (y2)) (global_size 12))))
+     ((0 ((local_size 12) (axes ()) (global_size 12)))
+      (1 ((local_size 12) (axes ()) (global_size 12))))
+     ((0 ((local_size 6) (axes (y2)) (global_size 12)))
+      (1 ((local_size 12) (axes ()) (global_size 12))))
+     ((0 ((local_size 2) (axes (y1 y2)) (global_size 12)))
+      (1 ((local_size 12) (axes ()) (global_size 12))))
+     ((0 ((local_size 2) (axes (y1 y2)) (global_size 12)))
+      (1 ((local_size 6) (axes (x2)) (global_size 12))))
+     ((0 ((local_size 2) (axes (y1 y2)) (global_size 12)))
+      (1 ((local_size 3) (axes (x1 x2)) (global_size 12))))) |}];
   let local_sizes = List.map path ~f:Array_type.local_size in
   print_s [%sexp (local_sizes : int list)];
   [%expect {| (6 12 24 72 144 72 24 12 6) |}]
@@ -404,25 +498,172 @@ let%expect_test "redistribute" =
      (Swap_within 0 x1 y1) (All_to_all 0 1)) |}];
   let path = perform_with_history mesh pgrm src in
   print_s [%sexp (path : Array_type.t list)];
-  [%expect{|
-    (((0 ((local_size 2) (axes (y1 y2)) (global_size 12)))
-      (1 ((local_size 3) (axes (x1 x2)) (global_size 12))))
-     ((0 ((local_size 1) (axes (x1 y1 y2)) (global_size 12)))
-      (1 ((local_size 6) (axes (x2)) (global_size 12))))
-     ((0 ((local_size 1) (axes (y1 x1 y2)) (global_size 12)))
-      (1 ((local_size 6) (axes (x2)) (global_size 12))))
-     ((0 ((local_size 3) (axes (x1 y2)) (global_size 12)))
-      (1 ((local_size 2) (axes (y1 x2)) (global_size 12))))
-     ((0 ((local_size 3) (axes (x1 y2)) (global_size 12)))
-      (1 ((local_size 2) (axes (x2 y1)) (global_size 12))))
-     ((0 ((local_size 3) (axes (y2 x1)) (global_size 12)))
-      (1 ((local_size 2) (axes (x2 y1)) (global_size 12))))
+  [%expect
+    {|
+    (((0 ((local_size 3) (axes (x1 x2)) (global_size 12)))
+      (1 ((local_size 2) (axes (y1 y2)) (global_size 12))))
+     ((0 ((local_size 3) (axes (x1 x2)) (global_size 12)))
+      (1 ((local_size 2) (axes (y2 y1)) (global_size 12))))
      ((0 ((local_size 3) (axes (x2 x1)) (global_size 12)))
       (1 ((local_size 2) (axes (y2 y1)) (global_size 12))))
-     ((0 ((local_size 3) (axes (x1 x2)) (global_size 12)))
-      (1 ((local_size 2) (axes (y2 y1)) (global_size 12))))
-     ((0 ((local_size 3) (axes (x1 x2)) (global_size 12)))
+     ((0 ((local_size 3) (axes (y2 x1)) (global_size 12)))
+      (1 ((local_size 2) (axes (x2 y1)) (global_size 12))))
+     ((0 ((local_size 3) (axes (x1 y2)) (global_size 12)))
+      (1 ((local_size 2) (axes (x2 y1)) (global_size 12))))
+     ((0 ((local_size 3) (axes (x1 y2)) (global_size 12)))
+      (1 ((local_size 2) (axes (y1 x2)) (global_size 12))))
+     ((0 ((local_size 1) (axes (y1 x1 y2)) (global_size 12)))
+      (1 ((local_size 6) (axes (x2)) (global_size 12))))
+     ((0 ((local_size 1) (axes (x1 y1 y2)) (global_size 12)))
+      (1 ((local_size 6) (axes (x2)) (global_size 12))))
+     ((0 ((local_size 2) (axes (y1 y2)) (global_size 12)))
+      (1 ((local_size 3) (axes (x1 x2)) (global_size 12))))) |}];
+  let local_sizes = List.map path ~f:Array_type.local_size in
+  print_s [%sexp (local_sizes : int list)];
+  [%expect {| (6 6 6 6 6 6 6 6 6) |}]
+
+let%expect_test "redistribute 2" =
+  let mesh : Mesh.t =
+    Mesh.create_exn [ ("x1", 2); ("x2", 2); ("y1", 3); ("y2", 2) ]
+  in
+  let src =
+    Array_type.of_list
+      [
+        Array_type.Dim.create 6 [ "x2" ] 12;
+        Array_type.Dim.create 2 [ "y1"; "y2" ] 12;
+      ]
+  in
+  let target =
+    Array_type.of_list
+      [
+        Array_type.Dim.create 4 [ "y1" ] 12;
+        Array_type.Dim.create 3 [ "x1"; "x2" ] 12;
+      ]
+  in
+  let pgrm = redistribute mesh src target in
+  print_s [%sexp (pgrm : Collective.t list)];
+  [%expect
+    {|
+    ((Dyn_slice 1 x1) (Swap_within 1 x1 y1) (All_to_all 1 0)
+     (Swap_within 0 x2 y1) (Swap_within 1 x1 y2) (Swap_eq_size_tops 1 0)
+     (Swap_within 1 x2 x1) (All_gather 0)) |}];
+  let path = perform_with_history mesh pgrm src in
+  print_s [%sexp (path : Array_type.t list)];
+  [%expect
+    {|
+    (((0 ((local_size 6) (axes (x2)) (global_size 12)))
+      (1 ((local_size 2) (axes (y1 y2)) (global_size 12))))
+     ((0 ((local_size 6) (axes (x2)) (global_size 12)))
+      (1 ((local_size 1) (axes (x1 y1 y2)) (global_size 12))))
+     ((0 ((local_size 6) (axes (x2)) (global_size 12)))
+      (1 ((local_size 1) (axes (y1 x1 y2)) (global_size 12))))
+     ((0 ((local_size 2) (axes (y1 x2)) (global_size 12)))
+      (1 ((local_size 3) (axes (x1 y2)) (global_size 12))))
+     ((0 ((local_size 2) (axes (x2 y1)) (global_size 12)))
+      (1 ((local_size 3) (axes (x1 y2)) (global_size 12))))
+     ((0 ((local_size 2) (axes (x2 y1)) (global_size 12)))
+      (1 ((local_size 3) (axes (y2 x1)) (global_size 12))))
+     ((0 ((local_size 2) (axes (y2 y1)) (global_size 12)))
+      (1 ((local_size 3) (axes (x2 x1)) (global_size 12))))
+     ((0 ((local_size 2) (axes (y2 y1)) (global_size 12)))
+      (1 ((local_size 3) (axes (x1 x2)) (global_size 12))))
+     ((0 ((local_size 4) (axes (y1)) (global_size 12)))
+      (1 ((local_size 3) (axes (x1 x2)) (global_size 12))))) |}];
+  let local_sizes = List.map path ~f:Array_type.local_size in
+  print_s [%sexp (local_sizes : int list)];
+  [%expect {| (12 6 6 6 6 6 6 6 12) |}]
+
+let%expect_test "redistribute 3" =
+  let mesh : Mesh.t =
+    Mesh.create_exn [ ("x1", 2); ("x2", 2); ("y1", 3); ("y2", 2) ]
+  in
+  let src =
+    Array_type.of_list
+      [
+        Array_type.Dim.create 4 [ "y1" ] 12;
+        Array_type.Dim.create 3 [ "x1"; "x2" ] 12;
+      ]
+  in
+  let target =
+    Array_type.of_list
+      [
+        Array_type.Dim.create 6 [ "x2" ] 12;
+        Array_type.Dim.create 2 [ "y1"; "y2" ] 12;
+      ]
+  in
+  let pgrm = redistribute mesh src target in
+  print_s [%sexp (pgrm : Collective.t list)];
+  [%expect
+    {|
+    ((Swap_within 1 x1 x2) (All_to_all 1 0) (Swap_within 0 y1 x2)
+     (Swap_for_eq_size_replicated 1 x1 y2) (All_to_all 0 1)) |}];
+  let path = perform_with_history mesh pgrm src in
+  print_s [%sexp (path : Array_type.t list)];
+  [%expect
+    {|
+    (((0 ((local_size 4) (axes (y1)) (global_size 12)))
+      (1 ((local_size 3) (axes (x1 x2)) (global_size 12))))
+     ((0 ((local_size 4) (axes (y1)) (global_size 12)))
+      (1 ((local_size 3) (axes (x2 x1)) (global_size 12))))
+     ((0 ((local_size 2) (axes (x2 y1)) (global_size 12)))
+      (1 ((local_size 6) (axes (x1)) (global_size 12))))
+     ((0 ((local_size 2) (axes (y1 x2)) (global_size 12)))
+      (1 ((local_size 6) (axes (x1)) (global_size 12))))
+     ((0 ((local_size 2) (axes (y1 x2)) (global_size 12)))
+      (1 ((local_size 6) (axes (y2)) (global_size 12))))
+     ((0 ((local_size 6) (axes (x2)) (global_size 12)))
       (1 ((local_size 2) (axes (y1 y2)) (global_size 12))))) |}];
   let local_sizes = List.map path ~f:Array_type.local_size in
   print_s [%sexp (local_sizes : int list)];
-  [%expect{| (6 6 6 6 6 6 6 6 6) |}]
+  [%expect {| (12 12 12 12 12 12) |}]
+
+let%expect_test "normal form" =
+  let mesh : Mesh.t =
+    Mesh.create_exn [ ("x1", 2); ("x2", 2); ("y1", 3); ("y2", 2) ]
+  in
+  let src =
+    Array_type.of_list
+      [
+        Array_type.Dim.create 4 [ "y1" ] 12;
+        Array_type.Dim.create 3 [ "x1"; "x2" ] 12;
+      ]
+  in
+  let pgrm =
+    [
+      Collective.Swap_for_eq_size_replicated (1, "x2", "y2");
+      Collective.Dyn_slice (0, "x2");
+    ]
+  in
+  let pgrm' = to_normal_form mesh src pgrm in
+  print_s [%sexp (pgrm' : Collective.t list)];
+  [%expect
+    {|
+    ((Dyn_slice 0 y2) (Swap_within 1 x2 x1) (Swap_eq_size_tops 0 1)
+     (Swap_within 1 y2 x1)) |}];
+  let res = perform mesh pgrm src in
+  let res' = perform mesh pgrm' src in
+  [%test_eq: Array_type.t] res res';
+  print_s [%sexp (res : Array_type.t)];
+  [%expect
+    {|
+    ((0 ((local_size 2) (axes (x2 y1)) (global_size 12)))
+     (1 ((local_size 3) (axes (x1 y2)) (global_size 12)))) |}];
+  print_s [%sexp (res' : Array_type.t)];
+  [%expect
+    {|
+    ((0 ((local_size 2) (axes (x2 y1)) (global_size 12)))
+     (1 ((local_size 3) (axes (x1 y2)) (global_size 12)))) |}];
+  let path = perform_with_history mesh pgrm' src in
+  print_s [%sexp (path : Array_type.t list)];
+  [%expect
+    {|
+    (((0 ((local_size 4) (axes (y1)) (global_size 12)))
+      (1 ((local_size 3) (axes (x1 x2)) (global_size 12))))
+     ((0 ((local_size 2) (axes (y2 y1)) (global_size 12)))
+      (1 ((local_size 3) (axes (x1 x2)) (global_size 12))))
+     ((0 ((local_size 2) (axes (y2 y1)) (global_size 12)))
+      (1 ((local_size 3) (axes (x2 x1)) (global_size 12))))
+     ((0 ((local_size 2) (axes (x2 y1)) (global_size 12)))
+      (1 ((local_size 3) (axes (y2 x1)) (global_size 12))))
+     ((0 ((local_size 2) (axes (x2 y1)) (global_size 12)))
+      (1 ((local_size 3) (axes (x1 y2)) (global_size 12))))) |}]
