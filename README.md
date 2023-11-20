@@ -1,6 +1,6 @@
 # partir-redistribution-ocaml
 
-This repo implements constructs from *[Memory-efficient array
+Implementations of constructs from *[Memory-efficient array
 redistribution through portable collective
 communication](https://arxiv.org/abs/2112.01075).*
 
@@ -23,13 +23,13 @@ val redistribute :
 
 ## Installation
 
-After installing `dune`, `core`, `ppx_jane` via opam, run tests with `dune runtest`.
+After installing `dune`, `core`, and `ppx_jane` via opam, run tests with `dune runtest`.
 
 ## Visual Example
 Given mesh of `{"x": 2, "y": 3}`, we can redistribute from `[3{"x"}6]` to
 `[2{"y"}6]` with the following collectives.
 
-Let the full contents on the undistributed array be `[0, ..., 5]`.
+Let the full contents of the undistributed array be `[0, ..., 5]`.
 
 ```
 [3{"x"}6]
