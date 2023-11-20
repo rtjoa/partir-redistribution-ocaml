@@ -1,6 +1,0 @@
-(executable
- (public_name redistribution)
- (name main)
- (libraries core redistribution)
- (preprocess
-  (pps ppx_jane)))
