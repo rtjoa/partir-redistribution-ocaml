@@ -1,6 +1,6 @@
 # partir-redistribution-ocaml
 
-Implementations of constructs from *[Memory-efficient array redistribution
+This repository implements constructs from *[Memory-efficient array redistribution
 through portable collective communication](https://arxiv.org/abs/2112.01075)*,
 mainly to solve the **memory-constrained redistribution problem** (Section 4.3).
 
