@@ -12,8 +12,8 @@ module Collective = struct
   [@@deriving compare, equal, sexp]
 end
 
-let perform_one (mesh : Mesh.t) (collective : Collective.t) (ty : Array_type.t)
-    : Array_type.t Or_error.t =
+let interpret_one (mesh : Mesh.t) (collective : Collective.t)
+    (ty : Array_type.t) : Array_type.t Or_error.t =
   match collective with
   | All_gather i -> Array_type.gather mesh ty i
   | Dyn_slice (i, axis) -> Array_type.slice mesh ty i axis
@@ -42,27 +42,27 @@ let perform_one (mesh : Mesh.t) (collective : Collective.t) (ty : Array_type.t)
   | Swap_within (i, axis1, axis2) ->
       Array_type.update_dim ty i ~f:(Dim_type.swap_within axis1 axis2)
 
-(* Wrap [perform_one] in checks of the Array_type validity*)
-let perform_one (mesh : Mesh.t) (collective : Collective.t) (ty : Array_type.t)
-    : Array_type.t Or_error.t =
+(* Wrap [interpret_one] in checks of the Array_type validity*)
+let interpret_one (mesh : Mesh.t) (collective : Collective.t)
+    (ty : Array_type.t) : Array_type.t Or_error.t =
   let%bind.Or_error () = Array_type.invariant mesh ty in
-  let%bind.Or_error ty = perform_one mesh collective ty in
+  let%bind.Or_error ty = interpret_one mesh collective ty in
   let%map.Or_error () = Array_type.invariant mesh ty in
   ty
 
-let perform (mesh : Mesh.t) (pgrm : Collective.t list) (ty : Array_type.t) :
+let interpret (mesh : Mesh.t) (pgrm : Collective.t list) (ty : Array_type.t) :
     Array_type.t Or_error.t =
   List.fold pgrm ~init:(Ok ty) ~f:(fun ty collective ->
-      Or_error.bind ty ~f:(perform_one mesh collective))
+      Or_error.bind ty ~f:(interpret_one mesh collective))
 
-let perform_with_history (mesh : Mesh.t) (pgrm : Collective.t list)
+let interpret_with_history (mesh : Mesh.t) (pgrm : Collective.t list)
     (ty : Array_type.t) =
   let%map.Or_error _, history =
     List.fold pgrm
       ~init:(Ok (ty, [ ty ]))
       ~f:(fun ty_and_history collective ->
         let%bind.Or_error ty, history = ty_and_history in
-        let%map.Or_error ty' = perform_one mesh collective ty in
+        let%map.Or_error ty' = interpret_one mesh collective ty in
         (ty', ty :: history))
   in
   history
@@ -102,7 +102,7 @@ end
 let fix_adjacent_collectives mesh src c1 c2 =
   let open Collective in
   let%bind.Or_error c1' = Collective_with_explicit_axes.create c1 src in
-  let%bind.Or_error src' = perform_one mesh c1 src in
+  let%bind.Or_error src' = interpret_one mesh c1 src in
   let%map.Or_error c2' = Collective_with_explicit_axes.create c2 src' in
   match (c1', c2') with
   (* Flatten peak: /\ ~~> \epsilon or \_/ or -- *)
@@ -200,9 +200,9 @@ let fix_adjacent_collectives mesh src c1 c2 =
 
 (* Wrap fix_adjacent_collectives in a check that we preserve redistribution semantics *)
 let fix_adjacent_collectives mesh src c1 c2 : Collective.t list Or_error.t =
-  let%bind.Or_error original_res = perform mesh [ c1; c2 ] src in
+  let%bind.Or_error original_res = interpret mesh [ c1; c2 ] src in
   let%map.Or_error cs = fix_adjacent_collectives mesh src c1 c2 in
-  match perform mesh cs src with
+  match interpret mesh cs src with
   | Error err ->
       raise_s
         [%message
@@ -216,7 +216,7 @@ let fix_adjacent_collectives mesh src c1 c2 : Collective.t list Or_error.t =
   | Ok fixed_res ->
       if not (Array_type.equal fixed_res original_res) then
         let c1' = Collective_with_explicit_axes.create c1 src |> ok_exn in
-        let src' = perform_one mesh c1 src |> ok_exn in
+        let src' = interpret_one mesh c1 src |> ok_exn in
         let c2' = Collective_with_explicit_axes.create c2 src' |> ok_exn in
         raise_s
           [%message
@@ -237,7 +237,7 @@ let rec step_to_normal_form (mesh : Mesh.t) (src : Array_type.t)
       let%bind.Or_error fixed = fix_adjacent_collectives mesh src c1 c2 in
       match fixed with
       | c :: cs ->
-          let%bind.Or_error src' = perform_one mesh c src in
+          let%bind.Or_error src' = interpret_one mesh c src in
           let%map.Or_error fixed_rest =
             step_to_normal_form mesh src' (cs @ rest)
           in
@@ -249,8 +249,8 @@ let rec step_to_normal_form (mesh : Mesh.t) (src : Array_type.t)
 let rec to_normal_form (mesh : Mesh.t) (src : Array_type.t)
     (pgrm : Collective.t list) : Collective.t list Or_error.t =
   let%bind.Or_error pgrm' = step_to_normal_form mesh src pgrm in
-  let%bind.Or_error original_res = perform mesh pgrm src in
-  let%bind.Or_error fixed_res = perform mesh pgrm' src in
+  let%bind.Or_error original_res = interpret mesh pgrm src in
+  let%bind.Or_error fixed_res = interpret mesh pgrm' src in
   assert (Array_type.equal original_res fixed_res);
   if List.equal Collective.equal pgrm' pgrm then Ok pgrm'
   else to_normal_form mesh src pgrm'
@@ -266,7 +266,6 @@ let fully_distribute_to (ty : Array_type.t) =
          Dim_type.axes dim
          |> List.rev_map ~f:(fun axis -> Collective.Dyn_slice (i, axis)))
 
-(* "Easy redistribution" as described at the top of Sec. 4.3 *)
 let redistribute_easy (src : Array_type.t) (target : Array_type.t) =
   List.append (fully_undistribute src) (fully_distribute_to target)
 
@@ -298,14 +297,14 @@ let%expect_test "redistribute easy" =
     {|
     ((All_gather 0) (All_gather 0) (All_gather 1) (All_gather 1) (Dyn_slice 0 y2)
      (Dyn_slice 0 y1) (Dyn_slice 1 x2) (Dyn_slice 1 x1)) |}];
-  let res = perform mesh pgrm src |> ok_exn in
+  let res = interpret mesh pgrm src |> ok_exn in
   [%test_eq: Array_type.t] res target;
   print_s [%sexp (res : Array_type.t)];
   [%expect
     {|
     ((0 ((local_size 2) (axes (y1 y2)) (global_size 12)))
      (1 ((local_size 3) (axes (x1 x2)) (global_size 12)))) |}];
-  let path = perform_with_history mesh pgrm src |> ok_exn in
+  let path = interpret_with_history mesh pgrm src |> ok_exn in
   print_s [%sexp (path : Array_type.t list)];
   [%expect
     {|
@@ -356,7 +355,7 @@ let%expect_test "redistribute" =
     ((Swap_within 1 y1 y2) (Swap_within 0 x1 x2) (Swap_eq_size_tops 0 1)
      (Swap_within 0 x1 y2) (Swap_within 1 x2 y1) (All_to_all 1 0)
      (Swap_within 0 x1 y1) (All_to_all 0 1)) |}];
-  let path = perform_with_history mesh pgrm src |> ok_exn in
+  let path = interpret_with_history mesh pgrm src |> ok_exn in
   print_s [%sexp (path : Array_type.t list)];
   [%expect
     {|
@@ -406,7 +405,7 @@ let%expect_test "redistribute 2" =
     {|
     ((All_to_all 1 0) (Swap_within 0 x2 y1) (All_to_all 0 1)
      (Swap_within 1 x2 y2) (Swap_top_for_eq_size_replicated 1 x1)) |}];
-  let path = perform_with_history mesh pgrm src |> ok_exn in
+  let path = interpret_with_history mesh pgrm src |> ok_exn in
   print_s [%sexp (path : Array_type.t list)];
   [%expect
     {|
@@ -450,7 +449,7 @@ let%expect_test "redistribute 3" =
     {|
     ((Swap_within 1 x1 x2) (All_to_all 1 0) (Swap_within 0 y1 x2)
      (Swap_top_for_eq_size_replicated 1 y2) (All_to_all 0 1)) |}];
-  let path = perform_with_history mesh pgrm src |> ok_exn in
+  let path = interpret_with_history mesh pgrm src |> ok_exn in
   print_s [%sexp (path : Array_type.t list)];
   [%expect
     {|
@@ -494,7 +493,7 @@ let%expect_test "redistribute 4" =
     {|
     ((Swap_within 1 y1 y2) (Swap_eq_size_tops 0 1) (Swap_within 0 x2 y2)
      (Swap_within 1 x1 y1) (Swap_eq_size_tops 0 1) (All_gather 0)) |}];
-  let path = perform_with_history mesh pgrm src |> ok_exn in
+  let path = interpret_with_history mesh pgrm src |> ok_exn in
   print_s [%sexp (path : Array_type.t list)];
   [%expect
     {|
@@ -541,8 +540,8 @@ let%expect_test "normal form" =
     {|
     ((Dyn_slice 0 y2) (Swap_within 1 x1 x2) (Swap_eq_size_tops 0 1)
      (Swap_within 1 x1 y2)) |}];
-  let res = perform mesh pgrm src |> ok_exn in
-  let res' = perform mesh pgrm' src |> ok_exn in
+  let res = interpret mesh pgrm src |> ok_exn in
+  let res' = interpret mesh pgrm' src |> ok_exn in
   [%test_eq: Array_type.t] res res';
   print_s [%sexp (res : Array_type.t)];
   [%expect
@@ -554,7 +553,7 @@ let%expect_test "normal form" =
     {|
     ((0 ((local_size 2) (axes (x2 y1)) (global_size 12)))
      (1 ((local_size 3) (axes (x1 y2)) (global_size 12)))) |}];
-  let path = perform_with_history mesh pgrm' src |> ok_exn in
+  let path = interpret_with_history mesh pgrm' src |> ok_exn in
   print_s [%sexp (path : Array_type.t list)];
   [%expect
     {|
@@ -587,8 +586,8 @@ let%expect_test "normal form 2" =
   print_s [%sexp (pgrm' : Collective.t list)];
   [%expect {|
     ((Swap_within 1 x1 x2) (All_gather 1)) |}];
-  let res = perform mesh pgrm src |> ok_exn in
-  let res' = perform mesh pgrm' src |> ok_exn in
+  let res = interpret mesh pgrm src |> ok_exn in
+  let res' = interpret mesh pgrm' src |> ok_exn in
   [%test_eq: Array_type.t] res res';
   print_s [%sexp (res : Array_type.t)];
   [%expect
@@ -600,7 +599,7 @@ let%expect_test "normal form 2" =
     {|
     ((0 ((local_size 4) (axes (y1)) (global_size 12)))
      (1 ((local_size 6) (axes (x1)) (global_size 12)))) |}];
-  let path = perform_with_history mesh pgrm' src |> ok_exn in
+  let path = interpret_with_history mesh pgrm' src |> ok_exn in
   print_s [%sexp (path : Array_type.t list)];
   [%expect
     {|
