@@ -7,5 +7,5 @@
 
 (package
  (name redistribution)
- (depends ocaml dune)
+ (depends ocaml dune core ppx_jane)
  (tags ()))
