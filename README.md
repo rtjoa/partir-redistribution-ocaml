@@ -1,25 +1,22 @@
 # partir-redistribution-ocaml
 
-This repository implements constructs from the paper "[Memory-efficient array
+This repo implements constructs from *[Memory-efficient array
 redistribution through portable collective
-communication](https://arxiv.org/abs/2112.01075)."
+communication](https://arxiv.org/abs/2112.01075).*
 
 The most notable functions are listed in
-[`lib/redistribute.mli`](lib/redistribute.mli), duplicated here:
+[`lib/redistribute.mli`](lib/redistribute.mli) and summarized here:
 
 ```ocaml
-(* Find the result type given an initial type and a series of collectives
-   performed on an array of that type *)
+(* Transform an array type via a sequence of collectives *)
 val interpret :
   Mesh.t -> Collective.t list -> Array_type.t -> Array_type.t Or_error.t
 
-(* Transform a sequence of collectives acting on some source array to normal
-   form *)
+(* Transform a sequence of collectives to normal form *)
 val to_normal_form :
   Mesh.t -> Array_type.t -> Collective.t list -> Collective.t list Or_error.t
 
-(* Generate a sequence of collectives in normal form to redistribute from one
-   array type to another *)
+(* Generate a redistribution program between array types in normal form *)
 val redistribute :
   Mesh.t -> Array_type.t -> Array_type.t -> Collective.t list Or_error.t
 ```
